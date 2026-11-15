@@ -97,6 +97,16 @@ const MAX_OUTPUT_TOKENS = 8192;
 const DEFAULT_OUTPUT_TOKENS = 1024;
 /** The most dial attempts one prompt costs, so the failures trail stays within 8 rows. */
 const MAX_ATTEMPTS = 8;
+/**
+ * How long one gateway dial may take before it counts as a refusal: a hung
+ * upstream used to hang the whole trial (the poll loop keeps running, the
+ * prompt never answers, the wall ends, the score is zero). A timed-out dial
+ * is recorded in the trail as `upstream_timeout`, cools that model, and the
+ * failover moves on to the next candidate. The timeout is on the dial only —
+ * it never picks a model and never changes a replay, where the cassette
+ * answers at once.
+ */
+const GATEWAY_DIAL_TIMEOUT_MS = 30_000;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -255,7 +265,12 @@ async function dial(model: string, body: Json): Promise<Response> {
     authorization: `Bearer ${GATEWAY_KEY}`,
   };
   if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify(gatewayBody(body, model)) });
+  return fetch(chatCompletionsUrl(), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(gatewayBody(body, model)),
+    signal: AbortSignal.timeout(GATEWAY_DIAL_TIMEOUT_MS),
+  });
 }
 
 /**
@@ -275,9 +290,10 @@ async function dialWithFailover(
     try {
       upstream = await dial(candidate.id, body);
     } catch (err) {
-      trail.push({ status: 502, code: 'upstream_unreachable', model: candidate.id });
+      const timedOut = (err as Error).name === 'TimeoutError';
+      trail.push({ status: timedOut ? 504 : 502, code: timedOut ? 'upstream_timeout' : 'upstream_unreachable', model: candidate.id });
       cooled.add(candidate.id);
-      log(`dial ${candidate.id}: transport error: ${(err as Error).message}`);
+      log(`dial ${candidate.id}: ${timedOut ? `no answer in ${GATEWAY_DIAL_TIMEOUT_MS} ms` : `transport error: ${(err as Error).message}`}`);
       continue;
     }
     if (!upstream.ok) {
@@ -305,53 +321,47 @@ function refused(res: ServerResponse, wire: 'openai' | 'anthropic', trail: Failu
   else sendError(res, wire, 502, 'upstream_error', detail);
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
-async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/**
+ * Serve one prompt on either wire: pick the candidates, dial with failover,
+ * and answer in the wire the client used. The two handlers used to be two
+ * copies of this same flow — one place where a prompt can go unanswered is
+ * easier to keep right than two. The wires differ only at the two ends:
+ * the Anthropic request is rewritten to Chat Completions before the dial
+ * and the answer is rewritten back after it; the OpenAI request passes
+ * through, and each wire names its own error when no model meets the prompt.
+ */
+async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' | 'anthropic'): Promise<void> {
   const body = await readJson(req);
-  if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  if (body === null) return sendError(res, wire, 400, 'invalid_request_error', 'the request body is not one JSON object');
   const candidates = rankedCandidates(requirementsFor(body));
-  if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
-  const served = await dialWithFailover(candidates, { ...body, model: 'auto' });
-  if (served.response === null || served.model === null) return refused(res, 'openai', served.trail);
-  const { response: upstream, model, trail } = served;
-  if (body.stream === true) {
-    const headers: Record<string, string> = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' };
-    if (trail.length > 0) headers['x-makefun-upstream-failures'] = JSON.stringify(trail);
-    res.writeHead(200, headers);
-    try {
-      for await (const frame of openAIStreamWithModel(upstream.body as ReadableStream<Uint8Array>, model)) res.write(frame);
-    } finally {
-      res.end();
-    }
-    return;
+  if (candidates.length === 0) {
+    return sendError(res, wire, 503, wire === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model in the brief meets this request');
   }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, model), trail);
-}
-
-/** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
-async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const candidates = rankedCandidates(requirementsFor(body));
-  if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
-  const upstreamBody = anthropicToOpenAI(body, 'auto');
+  const upstreamBody = wire === 'anthropic' ? anthropicToOpenAI(body, 'auto') : { ...body, model: 'auto' };
   const served = await dialWithFailover(candidates, upstreamBody);
-  if (served.response === null || served.model === null) return refused(res, 'anthropic', served.trail);
+  if (served.response === null || served.model === null) return refused(res, wire, served.trail);
   const { response: upstream, model, trail } = served;
   if (body.stream === true) {
     const headers: Record<string, string> = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' };
     if (trail.length > 0) headers['x-makefun-upstream-failures'] = JSON.stringify(trail);
     res.writeHead(200, headers);
     try {
-      for await (const event of anthropicEventsFromOpenAI(upstream.body as ReadableStream<Uint8Array>, model)) res.write(event);
+      const relay =
+        wire === 'anthropic'
+          ? anthropicEventsFromOpenAI(upstream.body as ReadableStream<Uint8Array>, model)
+          : openAIStreamWithModel(upstream.body as ReadableStream<Uint8Array>, model);
+      for await (const frame of relay) res.write(frame);
     } finally {
       res.end();
     }
     return;
   }
   const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, model), trail);
+  const shaped =
+    wire === 'anthropic'
+      ? openAIToAnthropic(isRecord(answer) ? answer : {}, model)
+      : openAIJsonWithModel(isRecord(answer) ? answer : {}, model);
+  sendJson(res, 200, shaped, trail);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -361,11 +371,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
-    await chat(req, res);
+    await serve(req, res, 'openai');
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/messages') {
-    await messages(req, res);
+    await serve(req, res, 'anthropic');
     return;
   }
   sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
