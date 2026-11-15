@@ -370,6 +370,10 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
+  if (req.method === 'GET' && url.pathname === '/health') {
+    sendJson(res, 200, { ok: true, models: servedModels().length });
+    return;
+  }
   if (req.method === 'GET' && url.pathname === '/v1/models') {
     models(req, res);
     return;
@@ -441,6 +445,9 @@ async function start(): Promise<void> {
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
   if (chatCompletionsUrl() === '') throw new Error('OPENAI_BASE_URL is not set');
+  if (freeModels(brief).length === 0) {
+    throw new Error('the brief lists no free model: this server could serve nothing, so it stops instead of registering a catalog no prompt can use');
+  }
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));

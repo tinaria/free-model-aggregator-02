@@ -287,12 +287,12 @@ function frameWithModel(frame: string, model: string): string {
 }
 
 /**
- * A Chat Completions SSE stream as it came, frame by frame, every data payload's
- * `model` the id this server dialled. Frames are split on the blank line that
- * ends them; a frame cut across reads is held until its end arrives, and a body
- * that ends without one is relayed as it is.
+ * The SSE frames of an upstream body, split on the blank line that ends each
+ * one. Both stream relays read the body this way: a frame cut across reads is
+ * held until its end arrives, and a body that ends without one is relayed as
+ * it is. One reader, one decoder, one place where a stream can stall.
  */
-export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+export async function* framesOf(upstream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -303,17 +303,26 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
       let at = buffer.indexOf('\n\n');
       while (at !== -1) {
-        const frame = buffer.slice(0, at);
+        yield buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') yield buffer;
   } finally {
     reader.releaseLock();
   }
+}
+
+/**
+ * A Chat Completions SSE stream as it came, frame by frame, every data payload's
+ * `model` the id this server dialled. Frames are split on the blank line that
+ * ends them; a frame cut across reads is held until its end arrives, and a body
+ * that ends without one is relayed as it is.
+ */
+export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  for await (const frame of framesOf(upstream)) yield frameWithModel(frame, model);
 }
 
 /**
@@ -323,9 +332,6 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
  * `model` is the id this server dialled, named back to the client.
  */
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
   let started = false;
   let finished = false;
   /** The stop reason a finish_reason named, held until the stream's usage chunk has arrived. */
@@ -450,23 +456,8 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     return out;
   };
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') for (const event of eventsOfFrame(buffer)) yield event;
-  } finally {
-    reader.releaseLock();
+  for await (const frame of framesOf(upstream)) {
+    for (const event of eventsOfFrame(frame)) yield event;
   }
   if (!finished) {
     for (const event of startEvents()) yield event;
