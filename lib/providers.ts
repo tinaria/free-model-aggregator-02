@@ -167,14 +167,14 @@ function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: J
  */
 function modelOf(v: unknown): ModelRow | null {
   if (!isRecord(v)) return null;
-  const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
+  const raw = (stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model)).trim();
   if (raw === '') return null;
   const named = stringOf(v.provider) !== '' ? stringOf(v.provider) : stringOf(v.wire);
   const id = named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
   return {
     id,
     provider: named === '' ? 'openrouter' : named,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : raw,
+    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name).trim() : raw,
     rating_milli: numberOrNull(v.rating_milli) ?? 0,
     context_length: numberOrNull(v.context_length),
     tools: boolOrNull(v.tools),
@@ -234,7 +234,14 @@ export function readBrief(path: string): Brief {
 
 /** The models this entry may serve: the brief's free ones, in the brief's order. */
 export function freeModels(brief: Brief): ModelRow[] {
-  return brief.models.filter((m) => m.free);
+  const seen = new Set<string>();
+  const out: ModelRow[] = [];
+  for (const model of brief.models) {
+    if (!model.free || seen.has(model.id)) continue;
+    seen.add(model.id);
+    out.push(model);
+  }
+  return out;
 }
 
 /** What a model can do, as the brief's row says it. */

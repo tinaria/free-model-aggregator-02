@@ -247,6 +247,10 @@ function failureCode(status: number, text: string): string {
 /** The gateway body for one dial: the output cap the gateway requires, added when the client named none. */
 function gatewayBody(body: Json, model: string): Json {
   const out: Json = { ...body, model };
+  for (const key of ['max_tokens', 'max_completion_tokens'] as const) {
+    const value = out[key];
+    if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) out[key] = Math.floor(Number(value));
+  }
   const hasCap =
     (typeof out.max_tokens === 'number' && Number.isFinite(out.max_tokens)) ||
     (typeof out.max_completion_tokens === 'number' && Number.isFinite(out.max_completion_tokens));

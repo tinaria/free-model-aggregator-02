@@ -75,7 +75,7 @@ export function openAIError(message: string, type: string, code: string | null):
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
-  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
+  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('');
 }
 
 /** One Anthropic content block as an OpenAI content part: text or an inline image; null for the rest. */
